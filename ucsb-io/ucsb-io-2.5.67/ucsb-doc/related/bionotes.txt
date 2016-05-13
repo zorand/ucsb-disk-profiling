@@ -1,0 +1,1150 @@
+Notes on 2.5 block i/o layer changes 
+------------------------------------
+
+Revision Date: 12/22/2001
+	
+	* Typos corrected by Randy Dundap 
+	* A few lines about the impact on drivers that use rq->buffer
+        * Sub-section on implications for components like diagnostics which 
+	  require direct low level access and the idea of pre-built commands 
+	  (related to Andre Hedrick's work)
+	* Some changes as of 2.5.1 (haven't gone through all)
+	- bi_end_io routine called once after all segments complete rather than
+	  multiple times
+	- Various REQ_XXX flags in the request queue
+	- Ingo Molnar's mempool used for bio_alloc instead of private pool
+	- A queue prebuilder function for pre-built commands support
+	- Correct segment accounting for h/w io segments (still a todo for
+	  me to discuss)
+	- Merge cache: optimization to try merging with last merged request
+	* On changing bio_vecs to kveclets (uniform currency across kernel)
+	  (patches from Ben LaHaise)
+	
+Revision Date: 11/28/2001
+
+	Updated to reflect multi-page bio design, which is part of the
+	the bio code that went into (2.5). Latest patch referred: 2.5.1-pre3
+
+Revision Date: 11/5/2001
+
+	Most of this was written based on a study of bio-14; an
+	attempt has been made to bring it uptodate with bio-15p6 but
+	since I haven't studied that in enough detail yet, it's possible that 
+	some things got missed.
+	(Based on Jens Axboe's bio patches from:
+	 ftp.kernel.org/pub/linux/people/axboe/v2.5)
+
+Introduction:
+
+These are some notes taken as part of attempt to understand 2.5 block 
+layer aspects, based on Jens Axboe's bio patches, in the context of
+several discussions in the past about generic block i/o abstraction/design 
+related issues. The idea is bring out the rationale behind some of the
+changes currently implemented or proposed/planned down the line, and a 
+discussion of some alternatives and ideas brought up by different people,
+and a few observations and suggestions. It's been kind of an evolving 
+document, that I keep updating as I learn more and come across more insights
+as a result of discussions with different people. So, it might still have
+some inaccuracies or mis-interpretations wherever my own understanding
+has been cloudy, and is by no means complete. Corrections & suggestions
+are more than welcome.
+
+Acknowlegements:
+
+Special thanks to Jens Axboe for clearing the mist on several occasions
+and helping me follow the patches, providing insights into the various issues
+and patiently reviewing a draft of this long meandering document in great
+detail (I do intend to cut it down a bit, once the multi-page iovec issues 
+and aspects of uniform representation across n/w and block i/o get sorted
+out - for now I wanted to just capture multiple options/viewpoints so we
+don't lose any ideas). And more importantly for taking up the difficult 
+and rather large piece of work that changing the block i/o infrastructure 
+involves. Thanks also to Christoph Hellwig for looking through an early 
+draft and pointing out several things that helped me understand this better 
+during our discussions. I might have completely lost out on some insights 
+into the elevator latency implementation had it not been for the discussions 
+with Arjan van de Ven regarding his priority based i/o scheduler proposal.
+Thanks to Andre Hedrick for bringing up certain bottom-up aspects of i/o layer
+design and introducing me to pre-built taskfile commands and considerations 
+for diagnostics, though this document is still deficient in coverage of 
+issues relevant from a low level perspective.
+
+I have referred to several other discussions, patches etc towards the
+end of the document. It's quite likely that I may not remember all the
+sources of information very clearly, so please do correct me if you
+notice anything I missed or am in error about.
+
+
+Regards
+Suparna Bhattacharya
+Linux Technology Center
+IBM Software Labs, India
+suparna@in.ibm.com
+
+------------------------------------------------------------------------
+
+Description of Contents:
+
+1. In the context of some overall block layer goals
+  1.1 Scope for tuning of logic to various needs
+    1.1.1 Tuning based on device or low level driver capabilities
+    1.1.2 Tuning based on high level requirements/capabilities
+    1.1.3 Direct access/bypass to lower layers for diagnostics and special
+	  device operations
+  1.2 Designing a minimalist yet general i/o structure or descriptor
+    1.2.1 Some aspects to consider 
+    1.2.2 The way this is achieved - introduction to the bio scheme
+	1.2.2.1 Discussion on various alternatives
+	1.2.2.2 Splitting/merging implications with each alternative
+	1.2.2.3 Impact on small i/os
+	1.2.2.4 Summary of discussions
+    1.2.3 The bio struct in detail (single page & multi-page bio design)
+	1.2.3.1 Using bios
+	1.2.3.3 Comments (and suggestions)
+  1.3 Improved and more efficient generic i/o scheduler
+    1.3.1 Things done to achieve these requirements
+  1.4 Ease of migration of older drivers
+2. Things in bio-patches but not discussed here
+3. Some other things to be discussed later (or referred to)
+4. A list of prior/related/impacted patches/ideas
+5. Other References/Discussion Threads
+
+---------------------------------------------------------------------------
+
+Bio Notes
+--------
+
+1. In the context of how some overall goals for the block layer are addressed:
+
+1.1. Adaptable abstractions to handle common processing with the ability to
+tune the logic to the appropriate extent depending on:
+
+1.1.1 Low level device / driver capabilities
+(e.g sophisticated devices with built-in caches, intelligent
+scheduling/optimization, high memory DMA support, etc may find some of the
+generic processing an overhead, while for less capable devices the generic
+functionality is essential for performance/correctness reasons)
+
+Knowledge of some of the capabilities / parameters of the device could be
+used effectively at the generic block layer to take the right decisions on
+behalf of the driver.
+
+Achieved through:
+
+Tuning at a per-queue level. e.g:
+
+i. Various parameters that the generic i/o scheduler logic uses are set at 
+a per-queue level (e.g maximum request size, maximum number of segments in 
+a scatter-gather list, hardsect size)
+
+ii. High-mem i/o capabilities
+
+Generic bounce buffer logic for drivers applied only for memory ranges
+where the device can't handle high-mem i/o.
+
+The dma mapping routines and associated data structures have now been
+modified to accomplish a direct page -> bus translation, without requiring
+a virtual address mapping, so this works uniformly for high-mem and low-mem
+pages. (See bio-14 README) [Note: Refer dma-mapping.txt for a discussion on PCI
+high mem DMA aspects and mapping of scatter gather lists, and support for
+64 bit PCI].
+
+Special handling is required only for cases where i/o needs to happen on
+pages residing in memory area beyond what the device can support.  In these
+cases, a bounce bio representing a buffer from the supported memory range
+is used for performing the i/o with copyin/copyout as needed depending on
+the type of the operation.  For example, in case of a read operation, the
+data read has to be copied to the original buffer on i/o completion, so a
+callback routine is set up to do this, while for write, the data is copied
+from the original buffer to the bounce buffer prior to issuing the
+operation. Since an original buffer may be in a high memory area that's not
+mapped in kernel virtual addr, a kmap operation may be required for
+performing the copy, and special care may be needed in the completion path
+as it may not be in irq context. Special care is also required (by way of
+GFP flags) when allocating bounce buffers, to avoid certain highmem
+deadlock possibilities. 
+
+It is also possible that a bounce buffer may be allocated from high-memory 
+area that's not mapped in kernel virtual addr, but within the range that the 
+device can use directly; so the bounce page may need to be kmapped during 
+copy operations. [Note: This does not hold in the current implementation, 
+though]
+
+There are some situations when pages from high memory may need to
+be kmapped, even if bounce buffers are not necessary. For example a device
+may need to abort DMA operations and revert to PIO for the transfer, in 
+which case a virtual mapping of the page is required. For SCSI it is also
+done in some scenarios where the low level driver cannot be trusted to 
+handle a single sg entry correctly. 
+
+
+iii. The i/o scheduler algorithm itself can be replaced/set as appropriate;
+it is possible to plugin/replace various pieces separately as well 
+(with improved modularization, e.g. more abstraction routines, e.g for
+init, add request, extract request )
+
+Elevator Linus and Elevator noop are the existing combinations that can be
+directly used, but a driver can provide relevant merge callbacks, in case
+it needs to do something different.  
+
+[TODO: revise the following given that merge hash is now obsolete]
+Elevator noop performs a merge check, but doesn't bother with sorting. It
+thus avoids wasting CPU cycles doing an insert scan (with the merge hash 
+this was possible as a scan wasn't no longer needed for a quick merge check 
+- see later), suitable for intelligent devices that reorder requests anyway. 
+Merging always helps in general, though.
+
+Elevator Linus attempts an insert scan after first trying for a merge (first
+a back merge, then a front merge, based on a tunable parameter). Often some 
+sorting still makes sense as the depth which most hardware can handle may be 
+less than the queue lengths during i/o loads.
+
+General cleanup: 
+Remark: Some parameters that were earlier available as global arrays
+indexed by major/minor are now associated with the queue. Some of these may
+move into the block device structure in the future. Some characteristics 
+have been incorporated into a queue flags field rather than separate fields 
+in themselves.  There are blk_queue_xxx functions to set the parameters, 
+rather than update the fields directly (e.g. the queuelist field). 
+
+
+1.1.2 High level code capabilities
+
+i. Application capabilities for raw i/o  (this comes from some of the
+high-performance database/middleware requirements - where the application
+tries to take its own i/o scheduling decisions based on an understanding of
+the access patterns and i/o characteristics)
+
+ii. High performance filesystems or other higher level kernel code's
+capabilities
+
+TBD: Not yet sure how this is addressed, though, I guess the flags field in
+the bio structure can be used for some tuning from above (e.g readahead,
+barrier), either through open flags or ioctls, or some other upper level
+mechanism. Another option may be to have a device node interface that
+initializes the queue elevator differently for such a raw device. Besides,
+bringing down the overheads of i/o scheduler processing itself may help to an
+extent in general (e.g with elevator noop), but we need some measurements 
+to check this out. (Todo: Check with jens/viro if /proc/iosched would include 
+such functionality)
+
+Note: There is a way to enforce strict ordering for i/os through barriers.
+All requests before a barrier point must be serviced before the barrier
+request and any other requests arriving after the barrier will not be 
+serviced until after the barrier has completed. This is useful for higher 
+level control on write ordering, e.g flushing a log of committed updates 
+to disk before the corresponding updates themselves.
+
+A flag in the bio structure, BIO_BARRIER is used to identify a barrier i/o.
+The generic i/o scheduler would make sure that it places the barrier request and
+all other requests coming after it, after all the previous requests in the
+queue. Barriers may be implemented in different ways depending on the
+driver. A SCSI driver for example could make use of ordered tags to
+preserve the necessary ordering with a lower impact on throughput. For IDE
+this might be a sync cache flush. Jens also has a queue barrier patch 
+intended to be merged with bio that adds a small interface for queues to 
+indicate what kind of barriers they can provide.
+
+Under discussion:
+Arjan's proposed request priority scheme allows higher levels some broad
+control (high/med/low) over the priority  of an i/o request vs other pending
+requests in the queue. For example it allows reads for bringing in an 
+executable page on demand to be given a higher priority over pending write
+requests which haven't aged too much on the queue. Potentially this priority
+could even be exposed to applications in some manner, providing higher level
+tunability. Time based aging avoids starvation of lower priority
+requests. Some bits in the bi_rw flags field in the bio structure are 
+intended to be used for this priority information. 
+ 
+The current elevator scheme provides a latency bound over how many future 
+requests can "pass" (get placed before) a given request, and this bound 
+is determined by the request type (read, write, reada). However, it doesn't 
+prioritize a new request over existing requests in the queue based on its 
+latency requirement. A new request could of course get serviced before 
+earlier requests based on the position on disk which it accesses. This is 
+due to the sort/merge in the  basic elevator scan logic, but irrespective 
+of the request's own priority/latency value. Interestingly the elevator
+sequence or the latency bound setting of the new request is unaffected by the 
+number of existing requests it has passed, i.e. doesn't depend on where
+it is positioned in the queue, but only on the number of requests that pass
+it in the future.
+
+
+1.1.3 Direct Access to Low level Device/Driver Capabilities (Bypass mode) 
+(e.g Diagnostics, Systems Management)
+
+There are situations where high-level code needs to have direct access to 
+the low level device capabilities or requires the ability to issue commands 
+to the device bypassing some of the intermediate i/o layers. 
+These could, for example, be special control commands issued through ioctl 
+interfaces, or could be raw read/write commands that stress the drive's 
+capabilities for certain kinds of fitness tests. Having direct interfaces at
+multiple levels without having to pass through upper layers makes
+it possible to perform bottom up validation of the i/o path, layer by 
+layer, starting from the media.
+
+The normal i/o submission interfaces, e.g submit_bio, could be bypassed 
+for specially crafted requests which such ioctl or diagnostics 
+interfaces would typically use, and the elevator add_request routine 
+can instead be used to directly insert such requests in the queue or preferably
+the blk_do_rq routine can be used to place the request on the queue and
+wait for completion. Alternatively, sometimes the caller might just
+invoke a lower level driver specific interface with the request as a
+parameter.
+
+If the request is a means for passing on special information associated with 
+the command, then such information is associated with the request->special 
+field (rather than misuse the request->buffer field which is meant for the 
+request data buffer's virtual mapping). 
+
+For passing request data, the caller must build up a bio descriptor 
+representing the concerned memory buffer if the underlying driver interprets 
+bio segments or uses the block layer end*request* functions for i/o 
+completion. Alternatively one could directly use the request->buffer field to 
+specify the virtual address of the buffer, if the driver expects buffer 
+addresses passed in this way and ignores bio entries for the request type 
+involved. In the latter case, the driver would modify/manage the 
+request->buffer, request->sector and request->nr_sectors/ 
+request->current_nr_sectors fields itself rather than using the block layer 
+end_request or end_that_request_first completion interfaces. 
+[To Check: end_that_request_last should be usable even in this case; Perhaps
+an end_that_direct_request_first routine could be implemented to make
+handling direct requests easier for such drivers; Also for drivers that
+expect bios, a helper function could be provided for setting up a bio 
+corresponding to a data buffer] 
+
+A request can be created with a pre-built custom command  to be sent directly
+to the device. The cmd block in the request structure has room for filling 
+in the command bytes. 
+
+The request structure flags can be set up to indicate the type of request 
+in such cases (REQ_PC: direct packet command passed to driver, REQ_BLOCK_PC:
+packet command issued via blk_do_rq, REQ_SPECIAL: special request).
+
+Per Andre, even aside of diagnostics and control command packets, it can help 
+to pre-build device commands for requests in advance, before placing then on 
+the queue, rather than construct the command on the fly in the driver while 
+servicing the request queue when it may affect latencies in interrupt context 
+or responsiveness in general. 
+
+Drivers can now specify a request prepare function (q->prep_rq_fn) that can
+be used to pre-build device commands for a given request, or other preparatory
+processing for the request [TBD/Ques: This routine seems to be called by 
+elv_next_request, which means this happens at request service time and not
+earlier, contrary to what we just discussed above. Need to understand why,
+and find out if there are any other implications]
+
+
+1.2. Designing a minimalist and yet generally usable i/o
+structure/descriptor.
+
+1.2.1 Some aspects:
+
+i.  Should be appropriate as a descriptor for both raw and buffered i/o  -
+avoid cache related fields which are irrelevant in the direct/page i/o path
+ii. Ability to represent large i/os w/o unecessarily breaking them up
+iii. At the same time, ability to retain independent identity of i/os from
+different sources or i/o units requiring individual completion (e.g. for
+latency reasons)
+iv. Preferably should be based on a memory descriptor structure that can be
+passed around different types of subsystems or layers, maybe even
+networking, without duplication or extra copies of data/descriptor fields
+themselves in the process
+v. Ability to handle possibility of splits/merges as the structure passes
+through layered drivers (lvm, md, evms), with minimal overhead.
+
+1.2.2 Achieved through:
+Defining a new structure (bio)  for the block layer, instead of using the
+buffer head structure (bh) directly, the idea being avoidance of some
+associated baggage and limitations. The bio structure is uniformly used for
+all i/o at the block layer ; it forms a part of the bh structure for
+buffered i/o, and in the case of raw/direct i/o kiobufs are mapped to bio
+structures.
+
+1.2.2.1 Discussion:
+
+Intent:
+- Discuss single-vs-multipage design considerations  (include aspect of
+splitting of i/os, i/o completion checks, compatibility)
+- Discuss choice of representation <pagelist, offset, len> vs list of
+<page, offset, len>  and tradeoffs; context of zero-copy n/w; similarity of
+representation for passing around sub-systems w/o making generic code
+complicated
+
+There has been a lot of discussion on various alternatives for representing
+the memory vector for an i/o that would satisfy the requirements at every
+level and yet have a low processing overhead as well as a low space
+overhead.  Here are some of those:
+
+i. For large i/o requests from user space - corresponding to a contiguous
+virtual address range (but discontiguous physical memory pages), a
+representation of the form  <pagearray, offset, len> has been used in
+kiobufs. This representation is also useful for driving large/clustered
+i/os from higher layers within the kernel (e.g SGI pagebufs). A vector of
+non page-aligned fragments would have to described as a vector of the above
+tuples, as used for kiovecs, which may be a trifle heavyweight if the
+fragments are smaller than a page.
+
+ii. A vector representation for scatter-gather requests at a higher level,
+as in readv  readv/writev, would be of the form <nr_entries, array of
+(vaddr_base, len)>, but would also require an address space context
+(current would be the default context at the highest level, but not at the
+lower layers of the stack) once the request has been submitted/queued; that
+would be <nr_entries, addr_space, array of (vaddr_base, len)>. This kind of
+an approach is taken in some other UNIX implementations (e.g uiop in AIX,
+with a cross-memory descriptor representation having scope for
+pre-translation to physical pages wherever it helps;  possibly something
+similar exists on SUN and ptx).  However, if there is a need to perform
+special processing for high-mem pages beyond the bounce limit, it may not
+be possible to completely delay translation to a much later stage, since
+bounce buffer copies may have to be performed at an early stage making it
+necessary to perform the check on the translated results early as well.
+
+iii. The zero-copy network stack uses a representation of the form
+<nr_frags, array of (page, offset, len)> which is useful for packing
+smaller than page size fragments from file(s) into network packets. Larry
+McVoy's proposal for a splice i/o model also advocates this kind of
+representation as a generic i/o currency, that can be referred to even from
+user level for initiating operations like streaming from disk files to
+network or vice-versa, without necessitating a virtual address mapping (in
+application address space). Allowing for partial page fragments makes it
+possible to directly scatter file data into memory for network packets
+leaving room for packet headers, and vice versa. When describing a large
+memory range, however, the per page, offset and len fields become redundant
+and add to processing overheads.
+
+Ben LaHaise's aio patches use a similar representation (called kvec).
+
+iv. In the current buffer head/request handling code (where the block layer
+links together the bh's for a merged request), the representation of the
+memory area for a scatter/gather i/o at the block request level appears in
+the form of a linked list (of bh's), i.e. virtually a list of <kvaddr_base,
+len>  elements, where each element is of blocksize units (not more than a
+page).  High mem i/os come in as <page, offset, len>,  but prior to Jens'
+newer highmem patches they were then converted to low mem bh's which have
+kvaddr_base before being put into the queue.  A lower level driver could
+build a scattergather list array from this list. The linked list elements
+have individual completion routines and completion status maintained, so
+independence of individual i/o units can be maintained at the queue level
+even when i/os are merged for performance reasons. However, this makes it
+necessary to break large i/os up into small chunks, each with added
+overhead of a bh field in terms of memory usage and the performance
+overhead of separate calls to push each broken piece down and then to
+collate them on the completion path, rather than process the whole in one
+go, especially in the elevator which eventually ends up merging contiguous
+requests anyway.
+
+
+1.2.2.2 Splitting/Merging implications in each of the above cases:
+
+One of the considerations in designing a suitable representation is how
+well it can handle splitting / merging of i/o requests at intermediate
+driver layers. Splitting could happen in the case of lvm or software raid,
+for example, when a request crosses stripe boundaries or physical volume
+boundaries. Merging typically happens as part of inserting a request at the
+right place in a device queue (i.e. within the i/o scheduler).
+
+Just a few words on how splitting/merging could work with each of the above
+to help understand the overheads.
+
+(i) kiobuf - pagearray, offset, len:
+
+Splitting:
+The kiobuf structure can be cloned, by pointing to the parent array, but
+using different values of offset and len in the child structures to
+represent different sub-portions of the main structure. Some kind of
+completion linkage has to be drawn between the parent and child (e.g
+through an i/o count) to get a notification when the entire i/o is
+complete. Getting to the pages in the sub-range can be achieved by a simple
+computation without having to traverse all the previous entries (as the
+page size is fixed). For a vector of non-aligned page fragments as with
+kiovecs, however the work would be much more, and would run into issues
+mentioned below under (ii).
+
+Merging:
+The array representation is inherently hard to extend (it would require a
+realloc and a copy to coalesce two such arrays). Information about
+notifying the callers in case of a merge of non-related i/os would require
+maintaining completion linkage information. An alternative is to have a
+linked list of these independent vectors. However this does mean that code
+that interprets this, would need to traverse both the list and the arrays
+for each entry in the list.
+
+(ii) virtual addr - cross mem descriptor based iovec:
+
+Splitting:
+A <vaddr_base, len> representation has the interesting characteristic of
+being able to cover a large chunk/area (crossing multiple pages) using a
+single entry (because the mapping to phys addr is already maintained by the
+system), which is very easy to split and where getting to a sub-range is
+trivial. For an array of <vaddr, len> of course, issues are just the same
+as discussed in (iii) below. But for cases with just a contiguous user
+virtual address range, where splitting typically happens (before placing
+the request on the queue) prior to eventual conversion to physical address
+ranges, this representation is convenient as far as this aspect is
+concerned. (Other issues exist)
+
+Merging:
+The issues are the same as (i)/(iii).
+
+(iii) zero copy networking type fragments/splice i/o style - page, offset,
+len:
+
+Splitting:
+Cloning could be achieved just as with (i), provided there is an outer
+<offset, len> information. Completion linkage requirements remain (unless
+the upper layer performs its own polling to figure this out without
+requiring any notification).  Getting to the fragments in the sub-range is
+a little more complicated here because previous entries need to be
+traversed given that fragments aren't of a fixed size.
+
+Merging:
+Issues same as in (i). If the limit on the number of fragments is small,
+then if space is preallocated for the maximum number of entries, then
+merging overheads are much less (so the linked list can be avoided, though
+completion chaining may be an issue). The tradeoff depends of how much
+space overhead this would imply per entry.
+
+(iv) linked list - current bh request list style:
+
+Splitting:
+If each broken piece is pushed down and handled one by one, splitting
+doesn't involve any overheads when it happens at block boundaries which
+usually is the case. In case splitting logic has to be applied on a chain
+of such buffers, then performing the actual split is a simple matter of
+breaking a link, but getting to the sub-fragment at a particular offset
+would necessarily involve traversing all the entries before it in the
+chain.
+
+Merging:
+This is just a simple matter of linking together two pieces or sub-chains.
+(Its the traversal process somewhere later that takes longer !)
+
+
+
+1.2.2.3 Impact on small i/os (non-fragmented buffer):
+
+If i/os mostly come in small independent chunks (each buffer being just a
+single contiguous range of memory that is less than a page), then i, ii,
+iii would involve a little overhead in terms of the check for number of
+fragments in each unit and an extra indirection into the array. In cases
+where space is preallocated for a maximum/default number of entries this is
+a slight memory overhead for such non-fragmented i/os.
+
+1.2.2.4 Summary
+
+The purpose of the above discussion was to bring out the trade-offs between
+single-page vs multi-page iobufs. Splitting/Merging is easier to handle
+when an iobuf has a single tuple, or uses a linked list representation when
+multiple tuples are necessary. A list involves an extra indirection +
+pointer space per element. Arrays on the other hand can be traversed more
+efficiently but may be suitable only for  small fixed max limits, with small
+entries. List traversals can be optimized to an extent through pre-fetch,
+though array traversals are still likely to be faster.
+
+In the former case, pushing down each tuple separately for processing
+results in some redundant processing which is an overhead, though if a
+chain is passed around, locating a sub-range for performing a split
+requires a traversal. In the latter case, if the array entries represent
+uniform size chunks then non-aligned fragments cannot be represented in one
+array; while for non-uniform chunks with separate offset, len, locating a
+sub-range again requires a traversal.
+
+1.2.3 The bio struct
+
+The bio structure (in its current form), uses a representation of a linked
+list of  bios each with a single unit tuple of <page, offset, len>.
+
+struct bio_vec {
+       struct page     *bv_page;
+       unsigned short  bv_len;
+       unsigned short  bv_offset;
+};
+
+/*
+ * main unit of I/O for the block layer and lower layers (ie drivers)
+ */
+struct bio {
+       sector_t         bi_sector;
+       struct bio       *bi_next;    /* request queue link */
+       atomic_t         bi_cnt;      /* free when it hits zero */
+       kdev_t           bi_dev;      /* will be block device */
+       unsigned long    bi_flags;    /* status, command, etc */
+       unsigned long    bi_rw;       /* low bits: r/w, high: priority */
+
+       unsigned int	bi_vcnt;	     /* how may bio_vec's */
+       unsigned int	bi_idx;	     /* current index into bio_vec array */
+       unsigned int	bi_size;     /* total size in bytes */
+       unsigned short 	bi_phys_segments; /* segments after physaddr coalesce*/
+       unsigned short	bi_hw_segments; /* segments after DMA remapping */
+       unsigned int	bi_max;	     /* max bio_vecs we can hold 
+                                        used as index into pool */
+       struct bio_vec   *bi_io_vec;  /* the actual vec list */
+       void (*bi_end_io)(struct bio *bio, int nr_sectors);
+       void             *bi_private;
+       void (*bi_destructor)(struct bio *);   
+};
+
+
+In the earlier (now obsolete) single-page bio design:
+
+- The code would break up larger i/os and push each unit down separately.
+  (the bio struct had only a single embedded bio_vec entry)
+- However, the processing overhead in the case of contiguous sub i/os was
+optimized through a merge hash (O(1) for a good hash distribution).
+- Splitting/Merging remained as simple as with the earlier bh design.
+- Using the linked list for unrelated merges makes independent completion
+easier to handle.
+
+At a lower level, drivers build a scatter gather list from the merged bios.
+The scattergather list is in the form of an array of <page, offset, len>
+entries with their corresponding dma address mappings filled in at the
+appropriate time. As an optimization, contiguous physical pages can be
+covered by a single entry where <page> refers to the first page and <len>
+covers the range of pages (upto 16 contiguous pages could be covered this
+way). 
+
+So, at the higher level,  we have a linked list based representation and at
+a lower level we have arrays, somewhat along the lines of an observation
+made by Roman Zippel during discussions on the kernel mailing list.
+
+
+With the new multipage bio design:
+
+- Large i/os can be sent down in one go using a bio_vec_list which consists
+  of an array of <page, offset, len> fragments (similar to the zero-copy
+  n/w code, and similar to Ben LaHaise's kvec design instead of using 
+  kiobufs in his aio patches)
+- There would be no merge hash 
+- Splitting would be achieved by cloning the bio (where the clone points to
+  the same bi_io_vec array, but with the index and size accordingly modified ?)
+- Continue using the linked list for unrelated merges - this avoids 
+  reallocs and makes independent completions easier to handle.
+- Code that traverses the req list needs to make a distinction between
+  segments of a request (bio_for_each_segment) and the distinct completion 
+  units/bios (rq_for_each_bio).
+
+The relevant fields in the bio struct (which were added for multipage
+bio support) are:
+
+bi_vcnt: how many bio_vec's this vec_list currently has
+bi_idx: pointer to "next" bio_vec to be processed. this is for drivers
+         that can't process a really big bio_vec list in one go (e.g a
+         1MB bio_vec needs to be handled in max 128kB chunks for IDE)
+bi_max: how many bio_vec's this bio can hold. 
+bi_io_vec: the bio_vecs
+
+The bi_end_io() routine now gets an indication of the number of sectors
+completed. It is typically called when the transfers for that bio are done.
+
+[Note: Right now the only user of bios with more than one page is ll_rw_kio,
+which in turn means that only raw I/O uses it (direct i/o may not work
+right now). The intent however is to enable clustering of pages etc to
+become possible.]
+
+
+1.2.3.1 Using bios
+
+There are routines for managing the allocation, and reference counting, and
+freeing of bios (bio_alloc, bio_get, bio_put). 
+
+This now makes use of Ingo Molnar's mempool implementation, which enables 
+subsystems like bio to maintain their own reserve memory pools for guaranteed 
+deadlock-free allocations during extreme VM load. For example, the VM 
+subsystem makes use of the block layer to writeout dirty pages in order to be 
+able to free up memory space, a case which needs careful handling. The 
+allocation logic draws from the preallocated emergency reserve in situations 
+where it cannot allocate through normal means. If the pool is empty and it
+can wait, then it would trigger action that would help free up memory or 
+replenish the pool (without deadlocking) and wait for availability in the pool. 
+If it is in IRQ context, and hence not in a position to do this, allocation 
+could fail if the pool is empty. In general mempool always first tries to 
+perform allocation without having to wait, even if it means digging into the 
+pool as long it is not less that 50% full. 
+
+On a free, memory is released to the pool or directly freed depending on
+the current availability in the pool. The mempool interface lets the
+subsystem specify the routines to be used for normal alloc and free. In the
+case of bio, these routines make use of the standard slab allocator. 
+
+The caller of bio_alloc is expected to taken certain steps to avoid
+deadlocks, e.g. avoid trying to allocate more memory from the pool while
+already holding memory obtained from the pool. 
+[Ques: How is this avoided in the bounce buffer case ? Doesn't create_bounce
+end up allocating a second bio ? ]
+Memory allocated from the pool should be released back within a limited 
+amount of time (in the case of bio, that would be after the i/o is completed). 
+This ensures that if part of the pool has been used up, some work (in this 
+case i/o) must already be in progress and memory would be available when it 
+is over. If allocating from multiple pools in the same code path, the order 
+or hierarchy of allocation needs to be consistent, just the way one deals 
+with multiple locks.
+
+With the multipage bio design, bio_alloc also needs to allocate the 
+bio_vec_list (bvec_alloc()). These are the 6 pools setup for different 
+size biovecs, so bio_alloc(gfp_mask, nr_iovecs) will allocate a vec_list of the 
+given size from these slabs.
+
+The bi_destructor() routine takes into account the possibility of the bio 
+having originated from a different source (see later discussions on
+n/w to block transfers and kvec_cb)
+
+The bio_get() routine may be used to hold an extra reference on a bio prior
+to i/o submission, if the bio fields are likely to be accessed after the
+i/o is issued (since the bio may otherwise get freed in case i/o completion
+happens in the meantime).
+
+The bio_clone() routine may be used to duplicate a bio, where the clone 
+shares the bio_vec_list with the original bio (i.e. both point to the
+same bio_vec_list). This would typically be used for splitting i/o requests
+in lvm or md. 
+
+With the introduction of multi-page bios support, end_that_request_first
+requires an additional argument indicating the number of sectors completed.
+
+The macros bio_for_each_segment() and rq_for_each_bio() should be used for
+traversing the bios in the request list (drivers should avoid directly
+trying to do it themselves). The blk_rq_map_sg() routine would be used for
+setting up scatter gather lists.  Keeping these internals behind such
+abstractions keeps things a little cleaner and would make it easier to modify
+the innards down the line without breaking the drivers. [Todo: Talk about
+phys and dma segments - device limits, vs host adapter limits, and correct
+segment accounting]
+
+Drivers that do not interpret bios e.g those which do not handle multiple
+segments and do not support i/o into high memory addresses (require bounce
+buffers) and expect only virtually mapped buffers, can access the rq->buffer
+field. As before the driver should use current_nr_sectors to determine the
+size of remaining data in the current segment (that is the maximum it can 
+transfer in one go unless it interprets segments), and rely on the block layer
+end_request, or end_that_request_first/last to take care of all accounting
+and transparent mapping of the next bio segment when a segment boundary 
+is crossed on completion of a transfer. (The end*request* functions should
+be used if only if the request has come down from block/bio path, not for
+direct access requests which only specify rq->buffer without a valid rq->bio)
+
+1.2.3.2 I/O Submission 
+
+The routine submit_bio() is used to submit a single io. Higher level i/o
+routines make use of this:
+
+(a) Buffered i/o:
+The routine submit_bh() invokes submit_bio() on a bio corresponding to the
+bh, allocating the bio if required. ll_rw_block() uses submit_bh() as before.
+
+(b) Kiobuf i/o:
+The ll_rw_kio() routine breaks up the kiobuf into page sized chunks and
+maps the array to one or more multi-page bios, issuing submit_bio() to 
+perform the i/o on each of these. 
+
+The embedded bh array in the kiobuf structure has been removed and no 
+preallocation of bios is done for kiobufs. [The intent is to remove the
+blocks array as well, but it's currently in there to kludge around direct i/o.]
+Thus kiobuf allocation has switched back to using kmalloc rather than vmalloc 
+[Todo: Check implications for direct i/o with Andrea]. 
+A single kiobuf structure is assumed to correspond to a contiguous range 
+of data, so brw_kiovec() invokes ll_rw_kio for each kiobuf in a kiovec. 
+[Observation: So right now it wouldn't work for direct i/o when i/o happens
+ from non-contiguous blocks. This is to be resolved]
+
+(c) Kvec i/o
+Note: Ben LaHaise's aio code uses a slighly different structure instead
+of kiobufs, called a kvec_cb. This contains an array of <page, offset, len>
+tuples (very much like the networking code), together with a callback function
+and data pointer. This is embedded into a brw_cb structure when passed
+to brw_kvec_async(). 
+
+Now it should be possible to directly map these kvecs to a bio. Just as while 
+cloning, in this case rather than PRE_BUILT bio_vecs, we set the bi_io_vec 
+array pointer to point to the veclet array in kvecs.
+
+TBD: In order for this to work, some changes are needed to the way multi-page
+bios are handled today. The values of the tuples in such a vector passed in
+from higher level code should not be modified by the block layer in the course
+of its request processing, since that would make it hard for the higher layer
+to continue to use the vector descriptor (kvec) after i/o completes. Instead,
+all such transient state should either be maintained in the request structure,
+and passed on in some way to the endio completion routine, and/or as a separate
+field in bio (say bi_cur_offset).
+
+Ben has already submitted some patches which make kveclets the i/o currency
+for bio (instead of bio_vecs), and for networking. These haven't made it to
+the tree as yet.
+
+(c) Page i/o:
+Christoph Hellwig has some code that uses bios for page-io (rather than
+bh). This isn't included in bio as yet. Christoph is also working on a
+design for representing virtual/real extents as an entity and modifying
+some of the address space ops interfaces to utilize this abstraction rather
+than buffer_heads. (This is somewhat along the lines of the SGI XFS pagebuf
+abstraction, but intended to be as lightweight as possible).
+
+Direct access requests that do not contain bios would be submitted differently
+as discussed earlier in 1.1.3.
+
+1.2.3.3 Comments:
+(a) bio-chain
+
+With the single-page bio design:
+Pushing each sub i/o separately has the overhead of extra function
+calls, and completion accounting/gathering (as each sub i/o has independent
+completion). There is also a duplication of information across these
+related bio heads. 
+
+One alternative that has been discussed earlier (sct) is
+to support passing down a chain of bios together. Traversal would be
+involved if a split is required, but that still should be more efficient
+than what happens now. Even this involves a certain duplication of 
+information in the bio fields, which could have been conveyed in a 
+single bio for the set of related i/os.  There is also the completion 
+path which this doesn't take care of.
+
+With the multi-page bio design:
+Large i/os can be pushed down in one shot and duplication of bio fields
+and the completion overheads are avoided. However, code that traverses
+the request has to traverse the array as well as the list. This would
+typically be hidden behind abstraction routines, but it does involve
+the overhead of an extra check for the array boundary per bio, especially
+single page bios or small ios. There is also one extra indirection to
+access the bio_vec list. (Not sure if this is of any significance)
+
+Another approach considered was to play some list tricks and have the head 
+of such a pre-built list be a bio, and all subsequent elements have a 
+smaller structure that just has the <page, offset, len> tuple
+equivalent (besides the next pointer ?). The last element in the chain
+would point to the head of the next such pre-built chain in the merged
+list. The code that traverses the list for locating the memory area in
+which to perform the i/o would be oblivious to the type of the container.
+Now, for the completion path, we could have a separate link field in the
+bio that would point to the next chain's bio head, and this should reduce
+intermediate completion invokations and gathering logic.
+[Note: this does require drivers to make a distinction between segments (on
+the way down) and completion units (on the way up), just as with the multi-page
+bio design.]
+
+(b) contiguous physical pages
+Another minor observation/question. Just as the scattergather list uses a
+single entry for contiguous physical pages, could the bio entry also do the
+same for contiguous physical pages in the same i/o request ? With
+improvements for larger page cache sizes, this would reduce the number of
+entries for representing a memory range. As Christoph correctly observes,
+even if a single tuple is used for representing large chunk in this manner,
+one might need to account for splitting the bio  (which would require a
+copy of the bio head) if crossing stripe/physical volume boundaries when
+passing through lvm or md  (i.e. simple remapping won't work in this case).
+
+(c) on passing the descriptor across subsystem boundaries
+Larry McVoy's splice i/o paper and some of the discussions on lkml about a
+uniform i/o representation on linux have brought up the aspect of
+optimizing transfers of i/o descriptors directly across subsystems with
+minimal copying/transformation overheads, e.g. for streaming i/o from
+network to disk and vice-versa.
+
+A characteristic of the network stack is the need for the ability to
+augment/strip packet headers over the basic payload (splitting the payload
+as required) through various levels in the stack. A similar requirement
+also exists in lower levels of the storage protocol stack, and for storage
+area networks as I understand from Dipankar.
+
+Given that the network stack already has its own scheme based on a scatter
+gather fragments array representation, one viewpoint is to design the block i/o
+structures to enable optimization of such transfers from block to network
+or vice-versa ? It could be convenient to pick up a payload array filled in
+during block i/o and just pass it on the the network stack.
+This was one of the reasons for seeking uniformity in representation across
+various subsystems. Since the networking stack appeared the most
+latency-critical and complex part to consider, it had seemed like the
+uniform representation should be guided by its needs.
+
+This should be possible now with the multi-page bio design, perhaps with
+some work to handle cross system memory passing.
+
+There may be a slightly different way of looking at this as well.
+The payload that would go to/from the block layer could typically be
+derived from/to several network packets and involves some transformation
+across subsystem boundaries. So it may not necessarily be quite as seamless
+as one would have liked it to. The idea of scattering block data directly
+into network packets seems attractive, but considering that the network
+stack is now already designed to handle fragments, the advantages seem less
+important. So, while we do need a simple representation at such levels, we
+still need to understand whether having the higher levels or the generic
+block layer use the same representation is necessarily quite as beneficial
+from a performance standpoint as it appears at first sight.   
+[ Comments required !! ]
+
+Another thought is to attempt some uniformity at the cost of an extra
+link field per-fragment. So, higher level code can use an array of fragments,
+with contiguous memory, but just that before passing it to the block layer, 
+the submission routine would have to compute and fill in the link fields so
+the block layer code can treat it as a linked list anyhow, and handle splits
+merges etc seamlessly. The same array could be passed on to the network
+layer in the form of the fragments array. [Todo: Need to check with DaveM 
+if this kind of thing is acceptable for the n/w layer, since he had mentioned 
+the possibility of lists for handling HIPPI, but preferred the low overheads
+of array setup for most typical situations. The extra link field would be
+unused in typical cases here, so performance-wise it should be close to
+the current case for networking, but need to understand if the space overhead 
+of the extra field is an issue]. The lower layers may still pull the elements
+into an array (as in a scatter-gather list), though it may be possible to
+conceive of optimizations in cases where all the fragments in a single
+request originated from the same source (Todo: Requires experimentation).
+
+
+(d) unrelated merges
+During a discussion on lkml, Andi Kleen had observed that unrelated merges
+seemed to be pretty rare in his setup, which leads to the question about
+how much processing or structural complexity it was worth including in the
+design just to account for such merges. We probably need to investigate
+this more under appropriate workloads. However Jens points out that even with 
+multi-page submission, it is possible for conceptually related i/o from the 
+same source, which cannot however be queued in one shot, to appear at the 
+block layer as unrelated merges. [ToThink: In what situations would it not 
+be possible to queue i/o in one go, while leaving room for a future merge ? ]
+
+
+(e) multiple i/o vector representations
+This doesn't sound efficient, no more than the multi-path (kiobuf/bh) hack
+that has been tried out in the past, but just so as to not lose the basic
+proposition, one way to make it possible for different kinds of iobuf
+representations be passed down would be to associate a routine with the
+request that would be called by a driver to build a scattergather list; the
+routine being set up according to the type of representation used in the
+request chain (array or list or anything else).
+
+(f) [Todo: completion chaining for layered i/o via wait-queue extension for
+async i/o]
+
+
+
+
+/* NOTE: End of i/o structure related discussion */
+
+
+1.3. Improved and more efficient  generic i/o scheduler
+
+Elevator algorithm to sort/merge/batch requests for optimal disk scan and
+request servicing performance (based on generic principles and device
+capabilities) optimized for:
+i. improved throughput
+ii. improved latency
+iii. better utilization of h/w & CPU time
+
+1.3.1 Achieved through:
+
+i. Hash for O(1) merge (Obsolete)/ Last merge hint (Current)
+
+[Note: The merge hash has been dropped as of bio-pre2-2 after integration into
+the 2.5 tree so the following discussion has become obsolete, but have
+retained this section for the sake of discussion and context]
+
+Rationale: One of the concerns with a single-page bio approach where each
+sub-io is passed to the block layer separately was the overhead of
+i/o scheduler processing in performing  the search for merge logic for each
+sub-io. By using a merge hash to enable detection of the merge position in
+O(1) time for good hash distributions, the insertion overhead for
+subsequent sub i/os has been brought down because these would hit the merge
+hash. For unrelated i/os the insertion overhead remains, in order to
+maintain the desired sort order for optimal disk scans.
+
+The hash merge logic checks for front and back merge (depending on i/o scheduler
+settings) against the hash (a global hash based on the device + sector 
+number, with per-chain locking). Only the first and last bios in a large 
+request are hashed at any time. The back-merge hash check is approximate 
+as it only detects the case where the previous bio is of the same size as 
+the current one. This was considered acceptable since it is only an 
+optimization. For a string of sub i/os corresponding to a larger i/o this 
+is likely to be the case except for the first and last pages of the area.
+
+Support for collection of hash statistics and merge rates was incorporated,
+on the basis of which some parameter tuning is possible. For example, front
+merging (i.e. a new request getting merged at the beginning of an earlier
+request in the queue) may be less likely for certain workloads. So having the 
+front merge hash check may not be worthwhile in those situations. We typically 
+expect only back-merges if chunks of a larger i/o are pushed down one in 
+order (Is there a situation where a reverse order would be used ?). So front 
+merges are expected only in the case of unrelated i/o initiators. Note that 
+even without the hash, an insert scan could also detect front merges; it just 
+would take a little more time, which in fact, may be quite acceptable.
+
+A /proc/iosched interface is planned for tuning / viewing i/o scheduler
+parameters and statistics details (Need to confirm with Jens). 
+
+[Note: Some of reasons for dropping the merge hash now:
+       - with multi-page bios, the hash is no longer essential
+       - complications, layering violations in the merge logic, locking issues
+         with such an approach
+
+Instead, right now, information about the last merge is saved as a hint for
+the subsequent request. This way, if sequential data is coming down the pipe,
+the hint can be used to speed up merges without going through a scan.
+]
+
+
+
+ii. Linked list for O(n) insert (linear scan) right now
+
+This is the same as before.
+
+The roadmap for bio-15 involved exploring use of binomial/fibonacci heaps
+to reduce the scan time; however the idea was given up due to the 
+complexity and added weight of data structures, complications for handling
+barriers, as well as the advantage of O(1) extraction and deletion 
+(performance critical path) with the existing list implementation 
+vs heap based implementations.
+
+There is however an added level of abstraction in the operations for adding
+and extracting a request to/from the queue, which makes it possible to
+try out alternative structures without changes to the users of the queue.
+Some things like head-active are thus now handled within elv_next_request
+making it possible to mark more than one request to be left alone.
+
+iii. Utilizes max_segments, and max_request_size  parameters, to merge
+within the limits that the device can handle
+[Todo: Discuss implications of phys and dma segment limits for segment
+ accounting]
+
+iv. Handling barrier cases
+  *Future insert scans limited by barrier
+  *Dissolve existing merge hash (obselete)
+
+When a barrier comes in, then :
+Since insert happens in the form of a linear scan, starting from the end, 
+it just needs to be ensured that this and future scans stops barrier point. 
+This is achieved by  skipping the entire merge/scan logic for a barrier 
+request, so it gets placed at the end of the queue, and specifying a zero 
+latency for the request containing the bio so that no future requests can 
+pass it.
+
+With the earlier merge hash approach, the existing merge hash also had to
+be dissolved because this and subsequent i/os can't be merged with any of 
+the previous requests which have hash entries. This hash invalidation was 
+optimized using a hash validity counter that would be simply incremented 
+at this time, and perform a lazy removal/invalidation of entries later 
+on-demand, when the entries got reused. 
+
+v. Plugging the queue to batch requests in anticipation of opportunities for
+merge/sort optimizations
+
+This is an approach that the current i/o scheduling algorithm resorts to so
+that it collects up enough requests in the queue to be able to take 
+advantage of the sorting/merging logic in the elevator. If the 
+queue is empty when a request comes in, then it plugs the request queue 
+(sort of like plugging the bottom of a vessel to get fluid to build up)
+till it fills up with a few more requests, before starting to service 
+the requests. This provides an opportunity to merge/sort the requests before 
+passing them down to the device. There are various conditions when the queue is 
+unplugged (to open up the flow again), either through a scheduled task or
+could be on demand. For example wait_on_buffer sets the unplugging going 
+(by running tq_disk) so the read gets satisfied soon.
+
+This is kind of controversial territory, as its not clear if plugging is
+always the right thing to do. Devices typically have their own queues,
+and allowing a big queue to build up in software, while letting the device be
+idle for a while may not always make sense. The trick is to handle the fine 
+balance between when to plug and when to open up. Also now that we have
+multi-page bios being queued in one shot, we may not need to wait to merge 
+a big request from the broken up pieces coming by. [TBD: This needs some
+thought - not sure what the right thing to do is ]
+
+[Ques: Could this be improved/tuned to yield improved pipeline efficiency
+based on device characteristics ? For example does plugging hurt latency
+under low i/o loads on a particular device ? Perhaps the priority indicator
+discussed earlier could be used as a basis for plugging/unplugging 
+decisions (with a time based aging scheme, as with Arjan's proposed
+priority i/o scheduler, this becomes easier to do).
+Todo: Need to go back and look for old discussions on this.
+]
+
+Note: In the read case, the queue gets explicitly unplugged as part of waiting 
+for completion, in fact all queues get unplugged as a side-effect. 
+
+Per-queue granularity unplugging (which is in Jens Todo list) may help 
+reduce some of the concerns with just a single tq_disk flush approach?  
+Something like blk_kick_queue() to unplug a specific queue (right away ?) 
+or optionally, all queues, is in the plan.
+
+
+Aside:
+BTW, merges and splits are delayed to the lowest layers possible (e.g
+remapping due to lvm/partitions is done at make_request level - happens
+before i/o scheduler is called).
+
+
+1.4 Ease of migration of older drivers (keep in mind old/unmaintained
+drivers for which we still have users; is there an easy way to maintain
+compatibility)
+
+(Refer to Jens' post of 11/28/2001 on linux-kernel describing things that
+ affect drivers)
+
+2. Things which are in the bio patches, but not covered here:
+
+2.1. Scalability (lock granularity)
+- io_request_lock replaced by a per-queue lock
+
+Leaving this to someone who understands the intricacies of these drivers :-)
+This could be a separate discussion.
+
+2.2. Partition-Remapping/gendisk reorg patch merged from Andries Browier
+- reorganizes some of the gendisk/partition related code 
+ Partition re-mapping at the block layer provides drivers with sector number 
+ relative to whole device; rather than having to take partition number
+ into account.
+ (Some more gendisk related changes I haven't looked into)
+
+[Remark: Haven't mentioned major/minor number/size related issues - goal of
+scalability to large number of devices, mknod-> devfs, 64 bit scsi support
+etc. As Christoph pointed out the introduction of sector_t prepares for 64
+bit, but BenLaHaise has the patch with the actual implementation ]
+
+
+3. Some other ideas that have been discussed earlier which aren't in this
+specific patch (yet):
+
+i. Submitting a pre-built list of bios directly, so it gets inserted at the
+right position in one go.  Instead multi-page bios are supported now, which
+can contain a memory vector array / iovec.
+
+ii. Page io operations directly using bio heads instead of bh's (changing
+brw_page) (Christoph Hellwig is currently working on a design for this
+through a higher level representation for real/virtual extents )
+
+
+4. Prior/Related/Impacted patches (not all of this may be relevant - just
+listing these right now for a start) from block-layer perspective:
+
+4.1. Earlier kiobuf patches (sct/axboe/chait/hch/mkp)
+- orig kiobuf & raw i/o patches (now in 2.4 tree)
+- direct kiobuf based i/o to devices (no intermediate bh's)
+- page i/o using kiobuf
+- kiobuf splitting for lvm (mkp)
+- elevator support for kiobuf request merging (axboe)
+4.2. Zero-copy n/w patches (Dave Miller)
+4.3.SGI  XFS - pagebuf patches - use of kiobufs
+4.4. Multi-page pioent patch for bio (Christoph Hellwig)
+4.5. Direct i/o implementation patch (Andrea Arcangeli)  - since
+2.4.10-pre11
+4.6. Async i/o implementation patch (Ben LaHaise)  - and i/o completion
+aspects (comparative look at SGI's kaio too)
+4.7. EVMS layering design (IBM EVMS team)
+4.8. Larger page cache size patch (Ben LaHaise) and large page size (Daniel
+Phillips) => larger contig phy mem buffers ?
+4.9. Page validity bitmaps ?
+4.10. Uniform request structure design idea (Ben LaHaise) - now in aio 
+as kvec_cb 
+4.11. VM reservations patch (Ben LaHaise)
+4.12. Write clustering patches ? (Marcelo/Quintela/Riel ?)
+4.13. Block device in page cache patch (Andrea Archangeli) - now in 2.4.10+
+4.14. Multiple block-size transfers for faster raw i/o (Shailabh Nagar)
+4.15  Priority based i/o scheduler - prepatches (Arjan van de Ven)
+4.16  IDE Taskfile i/o patch (Andre Hedrik)
+
+5. Other References:
+
+5.1 The Splice I/O Model - Larry McVoy (and subsequent discussions on lkml,
+and Linus' comments - Jan 2001)
+5.2 Discussions about kiobuf and bh design on lkml between sct, linus, alan 
+et al - Feb-March 2001 (many of the initial thoughts that led to bio were
+brought up in this discusion thread)
+5.3 Discussions on mempool on lkml - Dec 2001.
+

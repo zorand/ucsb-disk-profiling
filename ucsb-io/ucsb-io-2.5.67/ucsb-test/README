@@ -1,0 +1,9 @@
+
+To create test file use:
+dd bs=4096 count=10000 if=/dev/zero of=bigfile
+
+test.c and bigtest.c are the same except printfs.
+
+These are just simple test cases. Hope it will work in real world...
+
+Zoran

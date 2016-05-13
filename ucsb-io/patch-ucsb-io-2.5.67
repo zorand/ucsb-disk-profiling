@@ -1,0 +1,577 @@
+diff -urN linux-2.5.67/drivers/block/deadline-iosched.c ucsb-linux-2.5.67/drivers/block/deadline-iosched.c
+--- linux-2.5.67/drivers/block/deadline-iosched.c	2003-04-07 10:32:23.000000000 -0700
++++ ucsb-linux-2.5.67/drivers/block/deadline-iosched.c	2003-04-28 11:11:58.000000000 -0700
+@@ -18,6 +18,7 @@
+ #include <linux/compiler.h>
+ #include <linux/hash.h>
+ #include <linux/rbtree.h>
++#include <linux/ucsb_io.h>
+ 
+ /*
+  * See Documentation/deadline-iosched.txt
+@@ -64,6 +65,17 @@
+ 	sector_t last_sector;		/* head position */
+ 	unsigned int starved;		/* times reads have starved writes */
+ 
++#ifdef UCSB_IO
++	/* 
++	 * UCSB QoS requests for RT streams (r&w)
++	 */
++	struct list_head ucsb_queue;
++//	cycles_t ucsb_cycle;
++//	cycles_t ucsb_lastcycle;
++//	cycles_t ucsb_slack;
++	int ucsb_cnt;
++#endif /* ucsb_io */
++	
+ 	/*
+ 	 * settings that change how the i/o scheduler behaves
+ 	 */
+@@ -96,6 +108,9 @@
+ 	 */
+ 	struct list_head fifo;
+ 	unsigned long expires;
++#ifdef UCSB_IO
++	int ucsb_flag;
++#endif /* ucsb_io */
+ };
+ 
+ static void deadline_move_request(struct deadline_data *dd, struct deadline_rq *drq);
+@@ -266,6 +281,91 @@
+ 	}
+ }
+ 
++
++#ifdef UCSB_IO
++
++inline ucsb_QoS_t ucsb_io_type(struct bio *bio) {
++	if (bio->bi_qos) 
++		return bio->bi_qos->type;
++	else 
++		return UCSB_BESTEFFORT;
++}
++
++/*
++ * ucsb_io_add_request: if rq is not besteffort, put it to our queue.
++ */
++static inline void 
++ucsb_io_add_request(struct deadline_data *dd, struct request *rq)
++{
++	struct list_head *entry;
++	struct request *creq;
++	
++	/*
++	 * sorted by priority
++	 */
++
++	dd->ucsb_cnt++;
++
++	if (list_empty(&dd->ucsb_queue)) {
++		list_add_tail(&rq->queuelist, &dd->ucsb_queue);
++		return ;
++	}
++	
++	entry = &dd->ucsb_queue;
++	do {
++		entry = entry->next;
++		creq = list_entry_rq(entry);
++		if (creq->bio->bi_qos->priority < rq->bio->bi_qos->priority)
++			break;
++	} while (entry->next != &dd->ucsb_queue);
++	
++	while (creq->bio->bi_sector > rq->bio->bi_sector) {
++		entry = entry->prev;
++		if (entry == &dd->ucsb_queue) break;
++		creq = list_entry_rq(entry);
++	};
++	
++	list_add(&rq->queuelist,entry);
++	
++}
++
++static inline int
++ucsb_io_priority_queue_empty(struct deadline_data *dd)
++{
++	if (!list_empty(&dd->ucsb_queue))
++		return 1;
++	else return 0;
++}
++
++
++/*
++ * ucsb_io_dispatch_request: dispatch next request from QoS queue
++ * with priority greater or equal to priority. Returns 0 if no
++ * requests are dispatched
++ */
++
++static inline int
++ucsb_io_dispatch_request(struct deadline_data *dd, int priority)
++{
++	struct request *rq;
++	if (!list_empty(&dd->ucsb_queue)) {
++		rq = list_entry_rq(dd->ucsb_queue.next);
++		if (rq->bio->bi_qos->priority < priority)
++			return 0;
++		list_del_init(dd->ucsb_queue.next);
++		ucsb_log("Scheduling ucsb_io %d, sector=%Lu, %u\n",dd->ucsb_cnt,
++				(long long)rq->bio->bi_sector,bio_sectors(rq->bio));
++		//printk(KERN_EMERG "scheduling ucsb request %d\n",dd->ucsb_cnt);
++		dd->ucsb_cnt--;
++		list_add_tail(&rq->queuelist, dd->dispatch);
++		return 1;
++	} 
++	return 0;
++}
++
++#endif /* ucsb_io */
++
++
+ /*
+  * add drq to rbtree and fifo
+  */
+@@ -291,12 +391,22 @@
+ 
+ 	if (drq) {
+ 		struct deadline_data *dd = q->elevator.elevator_data;
+-
++#ifdef UCSB_IO
++		if (!drq->ucsb_flag) {
++			list_del_init(&drq->fifo);
++			deadline_del_drq_hash(drq);
++			deadline_del_drq_rb(dd, drq);
++		} else {
++			drq->ucsb_flag = 0;
++			ucsb_log("Removing ucsb_io. queue_size=%d\n",dd->ucsb_cnt);
++			//printk(KERN_EMERG "removing ucsb IO request\n");
++		}
++#else
+ 		list_del_init(&drq->fifo);
+ 		deadline_del_drq_hash(drq);
+ 		deadline_del_drq_rb(dd, drq);
++#endif /* ucsb_io */
+ 	}
+-
+ 	if (q->last_merge == &rq->queuelist)
+ 		q->last_merge = NULL;
+ 
+@@ -591,9 +701,28 @@
+ 		rq = list_entry_rq(dd->dispatch->next);
+ 		return rq;
+ 	}
++#ifdef UCSB_IO
++	/*
++	 * Service higher-priority requests
++	 */
++	if (ucsb_io_dispatch_request(dd,UCSB_DEF_PRIORITY))	
++		goto dispatch;
+ 
++	/*
++	 * Service Linux best-effort requests
++	 */ 
++	if (deadline_dispatch_requests(dd))
++		goto dispatch;
++
++	/*
++	 * Service background UCSB requests
++	 */
++	if (ucsb_io_dispatch_request(dd,0))	
++		goto dispatch;
++#else	
+ 	if (deadline_dispatch_requests(dd))
+ 		goto dispatch;
++#endif /* ucsb_io */ 
+ 
+ 	return NULL;
+ }
+@@ -604,7 +733,10 @@
+ {
+ 	struct deadline_data *dd = q->elevator.elevator_data;
+ 	struct deadline_rq *drq = RQ_DATA(rq);
+-
++#ifdef UCSB_IO
++	ucsb_QoS_t type;
++#endif
++	
+ 	if (unlikely(rq->flags & REQ_HARDBARRIER)) {
+ 		DL_INVALIDATE_HASH(dd);
+ 		q->last_merge = NULL;
+@@ -624,6 +756,22 @@
+ 		return;
+ 	}
+ 
++#ifdef UCSB_IO
++	/* Meta-scheduler: UCSB request? */
++	if (rq->bio) {
++		type = ucsb_io_type(rq->bio);
++		if(ucsb_stat.logflag) ucsb_debug("ucsb_io QoS type=%d\n",type);
++	} else type = UCSB_BESTEFFORT;
++	
++	if (type != UCSB_BESTEFFORT) {
++		ucsb_log("Adding ucsb_io %d (type=%d)\n",dd->ucsb_cnt,type);
++		//printk(KERN_EMERG "adding ucsb IO request %d\n",dd->ucsb_cnt+1);
++		drq->ucsb_flag = 1;
++		ucsb_io_add_request(dd,rq); 
++		return;
++	}
++#endif /* ucsb_io */
++	
+ 	if (rq_mergeable(rq)) {
+ 		deadline_add_drq_hash(dd, drq);
+ 
+@@ -640,6 +788,9 @@
+ 
+ 	if (!list_empty(&dd->fifo_list[WRITE])
+ 	    || !list_empty(&dd->fifo_list[READ])
++#ifdef UCSB_IO
++	    || !list_empty(&dd->ucsb_queue)
++#endif /* ucsb_io */ 
+ 	    || !list_empty(dd->dispatch))
+ 		return 0;
+ 
+@@ -729,6 +880,10 @@
+ 
+ 	INIT_LIST_HEAD(&dd->fifo_list[READ]);
+ 	INIT_LIST_HEAD(&dd->fifo_list[WRITE]);
++#ifdef UCSB_IO
++	INIT_LIST_HEAD(&dd->ucsb_queue);
++	dd->ucsb_cnt = 0;
++#endif /* ucsb_io*/
+ 	dd->sort_list[READ] = RB_ROOT;
+ 	dd->sort_list[WRITE] = RB_ROOT;
+ 	dd->dispatch = &q->queue_head;
+@@ -758,6 +913,9 @@
+ 			INIT_LIST_HEAD(&drq->hash);
+ 			RB_CLEAR(&drq->rb_node);
+ 			drq->request = rq;
++#ifdef UCSB_IO
++			drq->ucsb_flag = 0;
++#endif /* ucsb_io */
+ 			rq->elevator_private = drq;
+ 		}
+ 	}
+diff -urN linux-2.5.67/drivers/block/elevator.c ucsb-linux-2.5.67/drivers/block/elevator.c
+--- linux-2.5.67/drivers/block/elevator.c	2003-04-07 10:32:20.000000000 -0700
++++ ucsb-linux-2.5.67/drivers/block/elevator.c	2003-04-28 11:11:58.000000000 -0700
+@@ -37,6 +37,7 @@
+ #include <linux/compiler.h>
+ 
+ #include <asm/uaccess.h>
++#include <linux/ucsb_io.h>
+ 
+ /*
+  * This is a bit tricky. It's given that bio and rq are for the same
+@@ -301,6 +302,9 @@
+ 	spin_lock_irqsave(q->queue_lock, flags);
+ 	__elv_add_request(q, rq, at_end, plug);
+ 	spin_unlock_irqrestore(q->queue_lock, flags);
++#ifdef UCSB_IO
++	ucsb_log("elv_add_request: sector=%ld size=%ld\n",rq->sector,rq->nr_sectors);
++#endif /* ucsb_io */
+ }
+ 
+ static inline struct request *__elv_next_request(request_queue_t *q)
+diff -urN linux-2.5.67/drivers/block/genhd.c ucsb-linux-2.5.67/drivers/block/genhd.c
+--- linux-2.5.67/drivers/block/genhd.c	2003-04-07 10:31:16.000000000 -0700
++++ ucsb-linux-2.5.67/drivers/block/genhd.c	2003-04-28 11:11:58.000000000 -0700
+@@ -13,6 +13,7 @@
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
+ #include <linux/kmod.h>
++#include <linux/ucsb_io.h>
+ 
+ #define MAX_PROBE_HASH 255	/* random */
+ 
+@@ -258,6 +259,10 @@
+ 			    disk->minors, NULL, exact_match, exact_lock, disk);
+ 	register_disk(disk);
+ 	elv_register_queue(disk);
++#ifdef UCSB_IO
++	ucsb_debug("Added disk %15s, diskk major:minor=%d:%d\n", 
++			disk->disk_name, disk->major, disk->first_minor);
++#endif /* ucsb_io */
+ }
+ 
+ EXPORT_SYMBOL(add_disk);
+diff -urN linux-2.5.67/drivers/block/ll_rw_blk.c ucsb-linux-2.5.67/drivers/block/ll_rw_blk.c
+--- linux-2.5.67/drivers/block/ll_rw_blk.c	2003-04-07 10:30:42.000000000 -0700
++++ ucsb-linux-2.5.67/drivers/block/ll_rw_blk.c	2003-04-28 11:11:58.000000000 -0700
+@@ -27,6 +27,11 @@
+ #include <linux/completion.h>
+ #include <linux/slab.h>
+ #include <linux/swap.h>
++#include <linux/ucsb_io.h>
++
++#ifdef UCSB_IO
++inline ucsb_QoS_t ucsb_io_type(struct bio *);  /* from deadline_iosched.c */
++#endif
+ 
+ static void blk_unplug_work(void *data);
+ static void blk_unplug_timeout(unsigned long data);
+@@ -1677,7 +1682,11 @@
+ 	int el_ret, rw, nr_sectors, cur_nr_sectors, barrier;
+ 	struct list_head *insert_here;
+ 	sector_t sector;
+-
++#ifdef UCSB_IO
++	ucsb_QoS_t type;
++	ucsb_log("New request in __make_request\n");
++#endif
++	
+ 	sector = bio->bi_sector;
+ 	nr_sectors = bio_sectors(bio);
+ 	cur_nr_sectors = bio_iovec(bio)->bv_len >> 9;
+@@ -1705,6 +1714,11 @@
+ 	if (barrier)
+ 		goto get_rq;
+ 
++#ifdef UCSB_IO
++	type = ucsb_io_type(bio);
++	if (type != UCSB_BESTEFFORT) goto get_rq;	/* don't merge if ucsb_io */
++#endif	/* ucsb_io */
++
+ 	el_ret = elv_merge(q, &insert_here, bio);
+ 	switch (el_ret) {
+ 		case ELEVATOR_BACK_MERGE:
+Binary files linux-2.5.67/fs/.bio.c.swp and ucsb-linux-2.5.67/fs/.bio.c.swp differ
+Binary files linux-2.5.67/fs/.direct-io.c.swp and ucsb-linux-2.5.67/fs/.direct-io.c.swp differ
+Binary files linux-2.5.67/fs/.file_table.c.swp and ucsb-linux-2.5.67/fs/.file_table.c.swp differ
+Binary files linux-2.5.67/fs/.ioctl.c.swp and ucsb-linux-2.5.67/fs/.ioctl.c.swp differ
+diff -urN linux-2.5.67/fs/bio.c ucsb-linux-2.5.67/fs/bio.c
+--- linux-2.5.67/fs/bio.c	2003-04-07 10:31:48.000000000 -0700
++++ ucsb-linux-2.5.67/fs/bio.c	2003-04-28 11:11:58.000000000 -0700
+@@ -112,6 +112,7 @@
+ 	bio->bi_size = 0;
+ 	bio->bi_max_vecs = 0;
+ 	bio->bi_end_io = NULL;
++	bio->bi_qos = NULL;		/* ucsb_io */	
+ 	atomic_set(&bio->bi_cnt, 1);
+ 	bio->bi_private = NULL;
+ }
+diff -urN linux-2.5.67/fs/direct-io.c ucsb-linux-2.5.67/fs/direct-io.c
+--- linux-2.5.67/fs/direct-io.c	2003-04-07 10:31:46.000000000 -0700
++++ ucsb-linux-2.5.67/fs/direct-io.c	2003-04-28 11:11:58.000000000 -0700
+@@ -277,6 +277,12 @@
+ {
+ 	struct bio *bio = dio->bio;
+ 
++#ifdef UCSB_IO
++	if (dio->iocb->ki_filp)
++		bio->bi_qos = dio->iocb->ki_filp->f_qos;	/* ucsb_io */
++	else
++#endif /* ucsb_io */
++		bio->bi_qos = NULL;
+ 	bio->bi_private = dio;
+ 	atomic_inc(&dio->bio_count);
+ 	atomic_inc(&dio->bios_in_flight);
+diff -urN linux-2.5.67/fs/file_table.c ucsb-linux-2.5.67/fs/file_table.c
+--- linux-2.5.67/fs/file_table.c	2003-04-07 10:30:38.000000000 -0700
++++ ucsb-linux-2.5.67/fs/file_table.c	2003-04-28 11:11:58.000000000 -0700
+@@ -117,6 +117,9 @@
+ 	filp->f_uid    = current->fsuid;
+ 	filp->f_gid    = current->fsgid;
+ 	filp->f_op     = dentry->d_inode->i_fop;
++#ifdef UCSB_IO
++	filp->f_qos    = NULL;			/* ucsb_io */
++#endif
+ 	INIT_LIST_HEAD(&filp->f_list);
+ 	error = security_file_alloc(filp);
+ 	if (!error)
+@@ -136,6 +139,7 @@
+ {
+ 	struct inode * inode = file->f_dentry->d_inode;
+ 
++	if (file->f_qos) kfree(file->f_qos);	/* ucsb_io */
+ 	if (file->f_op && file->f_op->release)
+ 		file->f_op->release(inode, file);
+ 	security_file_free(file);
+diff -urN linux-2.5.67/fs/ioctl.c ucsb-linux-2.5.67/fs/ioctl.c
+--- linux-2.5.67/fs/ioctl.c	2003-04-07 10:30:46.000000000 -0700
++++ ucsb-linux-2.5.67/fs/ioctl.c	2003-04-28 11:11:58.000000000 -0700
+@@ -119,6 +119,48 @@
+ 			else
+ 				error = -ENOTTY;
+ 			break;
++#ifdef UCSB_IO
++		case UCSB_IO_GET_QOS:
++			if(!filp->f_qos) {
++				struct ucsb_io best_effort={UCSB_BESTEFFORT,0,0};
++				error = copy_to_user((struct ucsb_io *)arg, &best_effort, 
++						sizeof(struct ucsb_io)) ? -EFAULT : 0;
++			} else {
++				error = copy_to_user((struct ucsb_io *)arg, filp->f_qos, 
++						sizeof(struct ucsb_io)) ? -EFAULT : 0;
++			}
++			break;
++		case UCSB_IO_BESTEFFORT:
++			/* TODO: free f_qos and remove its bio's from QoS queues */
++			if (!filp->f_qos) {
++				filp->f_qos->type = UCSB_BESTEFFORT;
++				filp->f_qos->priority = UCSB_DEF_PRIORITY;
++				filp->f_qos->rate = 0;
++				filp->f_qos->filp = filp;
++			}
++			break;
++		case UCSB_IO_SOFT_RT:
++			if (!filp->f_qos) {
++				filp->f_qos = (struct ucsb_io *)
++						kmalloc(sizeof(struct ucsb_io), GFP_KERNEL);
++				filp->f_qos->priority = UCSB_DEF_PRIORITY+2;
++				filp->f_qos->filp = filp;
++			}
++			filp->f_qos->type = UCSB_SOFT_RT;
++			error = copy_from_user(&filp->f_qos->rate, (int *) arg, 
++						sizeof(int)) ? -EFAULT : 0;
++			break;
++		case UCSB_IO_PRIORITY:
++			if (!filp->f_qos) {
++				filp->f_qos = (struct ucsb_io *)
++						kmalloc(sizeof(struct ucsb_io), GFP_KERNEL);
++				filp->f_qos->type = UCSB_SOFT_RT;
++				filp->f_qos->filp = filp;
++			}
++			error = copy_from_user(&filp->f_qos->priority, (int *) arg, 
++						sizeof(int)) ? -EFAULT : 0;
++			break;
++#endif	/* ucsb_io */
+ 		default:
+ 			error = -ENOTTY;
+ 			if (S_ISREG(filp->f_dentry->d_inode->i_mode))
+diff -urN linux-2.5.67/fs/proc/proc_misc.c ucsb-linux-2.5.67/fs/proc/proc_misc.c
+--- linux-2.5.67/fs/proc/proc_misc.c	2003-04-07 10:30:43.000000000 -0700
++++ ucsb-linux-2.5.67/fs/proc/proc_misc.c	2003-04-28 11:11:58.000000000 -0700
+@@ -70,6 +70,28 @@
+ extern int get_ds1286_status(char *);
+ #endif
+ 
++#define UCSB_STAT_DEF
++#include <linux/ucsb_io.h>
++
++#ifdef UCSB_IO
++struct ucsb_io_stat ucsb_stat={UCSB_DEF_LOGFLAG,UCSB_DEF_TIMECYCLE};
++EXPORT_SYMBOL(ucsb_stat);
++
++static int ucsblog_toggle(char *page, char **start, off_t off,
++			 int count, int *eof, void *data)
++{
++	ucsb_stat.logflag^=1;
++	return 0;
++}
++
++static int ucsbstat_print(char *page, char **start, off_t off,
++				int count, int *eof, void *data)
++{
++	int len = sprintf(page, "ucsb_io: log=%d\n",ucsb_stat.logflag);
++	return proc_calc_metrics(page, start, off, count, eof, len);
++}
++#endif /* UCSB_IO */
++
+ static int proc_calc_metrics(char *page, char **start, off_t off,
+ 				 int count, int *eof, int len)
+ {
+@@ -578,6 +600,10 @@
+ #endif
+ 		{"locks",	locks_read_proc},
+ 		{"execdomains",	execdomains_read_proc},
++#ifdef UCSB_IO
++		{"ucsblog",	ucsblog_toggle},
++		{"ucsbstat",	ucsbstat_print},		
++#endif
+ 		{NULL,}
+ 	};
+ 	for (p = simple_ones; p->name; p++)
+diff -urN linux-2.5.67/include/linux/bio.h ucsb-linux-2.5.67/include/linux/bio.h
+--- linux-2.5.67/include/linux/bio.h	2003-04-07 10:32:19.000000000 -0700
++++ ucsb-linux-2.5.67/include/linux/bio.h	2003-04-28 11:11:58.000000000 -0700
+@@ -89,6 +89,7 @@
+ 	atomic_t		bi_cnt;		/* pin count */
+ 
+ 	void			*bi_private;
++	struct ucsb_io		*bi_qos;	/* ucsb_io QoS */
+ 
+ 	bio_destructor_t	*bi_destructor;	/* destructor */
+ };
+diff -urN linux-2.5.67/include/linux/fs.h ucsb-linux-2.5.67/include/linux/fs.h
+--- linux-2.5.67/include/linux/fs.h	2003-04-07 10:30:58.000000000 -0700
++++ ucsb-linux-2.5.67/include/linux/fs.h	2003-04-28 11:11:58.000000000 -0700
+@@ -20,6 +20,7 @@
+ #include <linux/radix-tree.h>
+ #include <linux/kobject.h>
+ #include <asm/atomic.h>
++#include <linux/ucsb_io.h>
+ 
+ struct iovec;
+ struct nameidata;
+@@ -443,6 +444,9 @@
+ 	/* Used by fs/eventpoll.c to link all the hooks to this file */
+ 	struct list_head	f_ep_links;
+ 	spinlock_t		f_ep_lock;
++#ifdef UCSB_IO
++	struct ucsb_io 		*f_qos;
++#endif
+ };
+ extern spinlock_t files_lock;
+ #define file_list_lock() spin_lock(&files_lock);
+diff -urN linux-2.5.67/include/linux/ucsb_io.h ucsb-linux-2.5.67/include/linux/ucsb_io.h
+--- linux-2.5.67/include/linux/ucsb_io.h	1969-12-31 16:00:00.000000000 -0800
++++ ucsb-linux-2.5.67/include/linux/ucsb_io.h	2003-04-28 11:11:58.000000000 -0700
+@@ -0,0 +1,60 @@
++#ifndef _UCSB_IO_H
++#define _UCSB_IO_H
++
++#include <linux/fs.h>
++
++#define UCSB_IO
++#define UCSB_DEBUG
++
++#define UCSB_DEF_TIMECYCLE 1000		/* in milliseconds */
++#define UCSB_DEF_LOGFLAG 0		/* tunr off ucsb_debug at boot time */
++
++typedef enum ucsb_QoS {
++	UCSB_BESTEFFORT = 0,	
++	UCSB_SOFT_RT	= 1,
++	UCSB_HARD_RT	= 2,		/* not yet used */
++	UCSB_PREEMPT	= 3,		/* not yet used */
++} ucsb_QoS_t;
++
++#define UCSB_DEF_PRIORITY 16
++
++struct ucsb_io {
++	ucsb_QoS_t 	type;
++	int 		priority;
++	int		rate;		/* not yet used */
++	struct file	*filp;		/* associated file if exists */
++};
++
++/* ioctl commands: */
++#define UCSB_IOCTL_BASE		'z'
++#define UCSB_IO_GET_QOS		_IOR(UCSB_IOCTL_BASE,0,sizeof(struct ucsb_io))
++#define UCSB_IO_BESTEFFORT	_IO(UCSB_IOCTL_BASE,1)
++#define UCSB_IO_SOFT_RT		_IOW(UCSB_IOCTL_BASE,2,sizeof(int))
++#define UCSB_IO_HARD_RT		_IOW(UCSB_IOCTL_BASE,3,sizeof(int))
++#define UCSB_IO_PRIORITY	_IOW(UCSB_IOCTL_BASE,4,sizeof(int))
++
++
++
++/* Stat and global state support */
++struct ucsb_io_stat {
++	int logflag;
++	int time_cycle;		/* not yet used - for kernel cycle-based scheduling */
++};
++
++
++#ifndef UCSB_STAT_DEF 
++extern struct ucsb_io_stat ucsb_stat;
++#endif
++
++/* Debug helper macros */
++#ifdef UCSB_DEBUG
++#define ucsb_debug(fmt,arg...) \
++        printk(KERN_DEBUG "UCSB " fmt,##arg)
++#else
++#define ucsb_debug(fmt,arg...) \
++	do { } while (0)
++#endif
++
++#define ucsb_log(fmt,arg...) do {if(ucsb_stat.logflag) ucsb_debug(fmt,##arg); } while (0)
++                
++#endif  /* _UCSB_IO_H */
