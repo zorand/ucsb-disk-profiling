@@ -13,11 +13,13 @@ We have submitted Scsibench paper for review. Please refer to the paper for info
 [Technical Report paper](http://alumni.cs.ucsb.edu/~zoran/scsibench/paper-scsibench.ps.gz)
 
 [Power point presentation for UCSB CS290I, Winter 2000.](http://alumni.cs.ucsb.edu/~zoran/scsibench/scsibench.ppt)
-Authors
+
+###Authors
 
 Zoran Dimitrijevic, zoran@cs.ucsb.edu
 David Watson, davidw@google.com
-Special thanks to:
+
+###Special thanks to:
 
 Raju Rangaswami, raju@cs.ucsb.edu
 Prof. Edward Chang, echang@ece.ucsb.edu
