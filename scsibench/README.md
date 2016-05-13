@@ -10,8 +10,9 @@ Documentation
 
 We have submitted Scsibench paper for review. Please refer to the paper for information about what can you do with Scsibench. The power point presentation is written in March 2000 as a graduate course final presentation.
 
-[a Technical Report paper](http://alumni.cs.ucsb.edu/~zoran/scsibench/paper-scsibench.ps.gz)
-[a Power point presentation for UCSB CS290I, Winter 2000.](http://alumni.cs.ucsb.edu/~zoran/scsibench/scsibench.ppt)
+[Technical Report paper](http://alumni.cs.ucsb.edu/~zoran/scsibench/paper-scsibench.ps.gz)
+
+[Power point presentation for UCSB CS290I, Winter 2000.](http://alumni.cs.ucsb.edu/~zoran/scsibench/scsibench.ppt)
 Authors
 
 Zoran Dimitrijevic, zoran@cs.ucsb.edu
