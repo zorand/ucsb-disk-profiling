@@ -17,10 +17,13 @@ We have submitted Scsibench paper for review. Please refer to the paper for info
 ###Authors
 
 Zoran Dimitrijevic, zoran@cs.ucsb.edu
+
 David Watson, davidw@google.com
 
 ###Special thanks to:
 
 Raju Rangaswami, raju@cs.ucsb.edu
+
 Prof. Edward Chang, echang@ece.ucsb.edu
+
 Prof. Anurag Acharya, acha@cs.ucsb.edu
